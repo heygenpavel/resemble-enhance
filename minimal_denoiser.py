@@ -229,12 +229,112 @@ def load_model(checkpoint: Path, device: str = "cpu") -> Denoiser:
     return model
 
 
-def denoise_audio(model: Denoiser, wav: Tensor, sr: int) -> tuple[Tensor, int]:
+@torch.no_grad()
+def _inference_chunk(model: Denoiser, wav: Tensor, pad: int = 441) -> Tensor:
+    length = wav.shape[-1]
+    abs_max = wav.abs().max().clamp(min=1e-7)
+
+    wav = wav.to(model.dummy.device)
+    wav = wav / abs_max
+    wav = F.pad(wav, (0, pad))
+
+    out = model(wav[None])[0].cpu()
+    out = out[:length]
+    out = out * abs_max
+    return out
+
+
+def _compute_corr(x: Tensor, y: Tensor) -> Tensor:
+    return torch.fft.ifft(torch.fft.fft(x) * torch.fft.fft(y).conj()).abs()
+
+
+def _compute_offset(chunk1: Tensor, chunk2: Tensor, sr: int) -> int:
+    hop_length = sr // 200
+    win_length = hop_length * 4
+    n_fft = 2 ** (win_length - 1).bit_length()
+    mel_fn = torchaudio.transforms.MelSpectrogram(
+        sample_rate=sr,
+        n_fft=n_fft,
+        win_length=win_length,
+        hop_length=hop_length,
+        n_mels=80,
+        f_min=0.0,
+        f_max=sr // 2,
+    )
+
+    spec1 = mel_fn(chunk1).log1p()
+    spec2 = mel_fn(chunk2).log1p()
+
+    corr = _compute_corr(spec1, spec2).mean(dim=0)
+
+    argmax = corr.argmax().item()
+    if argmax > len(corr) // 2:
+        argmax -= len(corr)
+
+    return -argmax * hop_length
+
+
+def _merge_chunks(chunks: list[Tensor], chunk_len: int, hop_len: int, *, sr: int, length: int) -> Tensor:
+    overlap_len = chunk_len - hop_len
+    signal_len = (len(chunks) - 1) * hop_len + chunk_len
+    signal = torch.zeros(signal_len, device=chunks[0].device)
+
+    fadein = torch.linspace(0, 1, overlap_len, device=chunks[0].device)
+    fadein = torch.cat([fadein, torch.ones(hop_len, device=chunks[0].device)])
+    fadeout = torch.linspace(1, 0, overlap_len, device=chunks[0].device)
+    fadeout = torch.cat([torch.ones(hop_len, device=chunks[0].device), fadeout])
+
+    for i, chunk in enumerate(chunks):
+        start = i * hop_len
+        end = start + chunk_len
+
+        if len(chunk) < chunk_len:
+            chunk = F.pad(chunk, (0, chunk_len - len(chunk)))
+
+        if i > 0:
+            pre = chunks[i - 1][-overlap_len:]
+            cur = chunk[:overlap_len]
+            offset = _compute_offset(pre, cur, sr)
+            start -= offset
+            end -= offset
+
+        if i == 0:
+            chunk = chunk * fadeout
+        elif i == len(chunks) - 1:
+            chunk = chunk * fadein
+        else:
+            chunk = chunk * fadein * fadeout
+
+        signal[start:end] += chunk[: signal[start:end].shape[-1]]
+
+    return signal[:length]
+
+
+def denoise_audio(
+    model: Denoiser,
+    wav: Tensor,
+    sr: int,
+    *,
+    chunk_seconds: float | None = None,
+    overlap_seconds: float = 1.0,
+) -> tuple[Tensor, int]:
     if sr != model.hp.wav_rate:
         wav = torchaudio.functional.resample(wav, sr, model.hp.wav_rate)
         sr = model.hp.wav_rate
-    with torch.no_grad():
-        out = model(wav[None])[0].cpu()
+
+    if not chunk_seconds:
+        return _inference_chunk(model, wav), sr
+
+    chunk_len = int(sr * chunk_seconds)
+    overlap_len = int(sr * overlap_seconds)
+    hop_len = chunk_len - overlap_len
+
+    chunks = []
+    for start in range(0, wav.shape[-1], hop_len):
+        chunks.append(_inference_chunk(model, wav[start : start + chunk_len]))
+
+    out = _merge_chunks(chunks, chunk_len, hop_len, sr=sr, length=wav.shape[-1])
+
     return out, sr
 
 
@@ -244,13 +344,33 @@ def main():
     parser.add_argument("--input", type=Path, required=True, help="Input wav file")
     parser.add_argument("--output", type=Path, required=True, help="Output wav file")
     parser.add_argument("--device", type=str, default="cpu", help="cpu or cuda")
+    parser.add_argument(
+        "--chunk-seconds",
+        type=float,
+        default=30.0,
+        help="Chunk size in seconds (0 disables chunking)",
+    )
+    parser.add_argument(
+        "--overlap-seconds",
+        type=float,
+        default=1.0,
+        help="Overlap between chunks in seconds",
+    )
+
     args = parser.parse_args()
 
     wav, sr = torchaudio.load(str(args.input))
     wav = wav.mean(dim=0)
 
     model = load_model(args.checkpoint, device=args.device)
-    out, sr = denoise_audio(model, wav, sr)
+    chunk = args.chunk_seconds if args.chunk_seconds > 0 else None
+    out, sr = denoise_audio(
+        model,
+        wav,
+        sr,
+        chunk_seconds=chunk,
+        overlap_seconds=args.overlap_seconds,
+    )
 
     torchaudio.save(str(args.output), out.unsqueeze(0), sr)
 
