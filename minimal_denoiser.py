@@ -334,6 +334,7 @@ def denoise_audio(
         chunks.append(_inference_chunk(model, wav[start : start + chunk_len]))
 
     out = _merge_chunks(chunks, chunk_len, hop_len, sr=sr, length=wav.shape[-1])
+
     return out, sr
 
 
@@ -355,6 +356,7 @@ def main():
         default=1.0,
         help="Overlap between chunks in seconds",
     )
+
     args = parser.parse_args()
 
     wav, sr = torchaudio.load(str(args.input))
