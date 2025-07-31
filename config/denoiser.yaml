@@ -1,2 +1,0 @@
-batch_size_per_gpu: 32
-training_seconds: 3.0
